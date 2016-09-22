@@ -14,7 +14,8 @@ SCALA_VERSION="2.9.2"
 APP_HOME="/usr/local/$APP_NAME/current"
 INITIAL_SLEEP=15
 
-JAR_NAME="${APP_NAME}_${SCALA_VERSION}-${VERSION}.jar"
+source base.sh
+JAR=$(find_jar $APP_HOME)
 STAGE="production"
 FD_LIMIT="262144"
 
@@ -30,10 +31,6 @@ test -f /etc/sysconfig/kestrel && . /etc/sysconfig/kestrel
 JAVA_OPTS="-server -Dstage=$STAGE $GC_OPTS $GC_TRACE $GC_LOG $HEAP_OPTS $DEBUG_OPTS"
 
 pidfile="/var/run/$APP_NAME/$APP_NAME.pid"
-# This second pidfile exists for legacy purposes, from the days when kestrel
-# was started by daemon(1)
-daemon_pidfile="/var/run/$APP_NAME/$APP_NAME-daemon.pid"
-
 
 running() {
   kill -0 `cat $pidfile`
@@ -58,11 +55,6 @@ case "$1" in
   start)
     echo -n "Starting $APP_NAME... "
 
-    if [ ! -r $APP_HOME/$JAR_NAME ]; then
-      echo "FAIL"
-      echo "*** $APP_NAME jar missing: $APP_HOME/$JAR_NAME - not starting"
-      exit 1
-    fi
     if [ ! -x $JAVA_HOME/bin/java ]; then
       echo "FAIL"
       echo "*** $JAVA_HOME/bin/java doesn't exist -- check JAVA_HOME?"
@@ -84,7 +76,7 @@ case "$1" in
     ulimit -n $FD_LIMIT || echo -n " (no ulimit)"
     ulimit -c unlimited || echo -n " (no coredump)"
 
-    sh -c "echo "'$$'" > $pidfile; echo "'$$'" > $daemon_pidfile; exec ${JAVA_HOME}/bin/java ${JAVA_OPTS} -jar ${APP_HOME}/${JAR_NAME} >> /var/log/$APP_NAME/stdout 2>> /var/log/$APP_NAME/error" &
+    sh -c "echo "'$$'" > $pidfile; exec ${JAVA_HOME}/bin/java ${JAVA_OPTS} -jar $JAR >> /var/log/$APP_NAME/stdout 2>> /var/log/$APP_NAME/error" &
     disown %-
     sleep $INITIAL_SLEEP
 
@@ -113,8 +105,8 @@ case "$1" in
       tries=$((tries + 1))
       if [ $tries -ge 15 ]; then
         echo "FAILED SOFT SHUTDOWN, TRYING HARDER"
-        if [ -f $daemon_pidfile ]; then
-          kill $(cat $daemon_pidfile)
+        if [ -f $pidfile ]; then
+          kill $(cat $pidfile)
         else
           echo "CAN'T FIND PID, TRY KILL MANUALLY"
           exit 1
@@ -124,7 +116,7 @@ case "$1" in
           hardtries=$((hardtries + 1))
           if [ $hardtries -ge 5 ]; then
             echo "FAILED HARD SHUTDOWN, TRY KILL -9 MANUALLY"
-            kill -9 $(cat $daemon_pidfile)
+            kill -9 $(cat $pidfile)
           fi
           sleep 1
         done

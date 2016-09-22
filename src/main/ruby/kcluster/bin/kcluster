@@ -6,6 +6,7 @@ require 'optparse'
 require 'socket'
 require 'net/http'
 require 'json'
+require 'cgi'
 
 # FIXME this really only works inside twitter. it would be nice to support
 # a general serverset interface (or opensource colony).
@@ -27,7 +28,7 @@ def verbose(s)
   puts s if $options[:verbose]
 end
 
-def status(s)
+def print_status(s)
   print s
   STDOUT.flush
 end
@@ -49,7 +50,7 @@ end
 def fetch_stats(hostname, port, data)
   verbose "--- Fetching stats from #{hostname}:#{port}"
   begin
-    stats = JSON.parse Net::HTTP.get URI.parse("http://#{hostname}:#{port}/stats.json?period=5")
+    stats = JSON.parse Net::HTTP.get URI.parse("http://#{hostname}:#{port}/stats.json?period=60")
   rescue
     puts "WARNING: Unable to fetch stats for #{hostname}:#{port}"
     return
@@ -88,7 +89,8 @@ end
 def fetch_all
   data = new_queue_stats
   $options[:server_list].each do |server|
-    fetch_stats(server, $options[:port], data)
+    (host, port) = get_server_parts(server, $options[:port])
+    fetch_stats(host, port, data)
   end
   data
 end
@@ -97,7 +99,8 @@ def fetch_all_by_host
   data = {}
   $options[:server_list].each do |server|
     data[server] = new_queue_stats
-    fetch_stats(server, $options[:port], data[server])
+    (host, port) = get_server_parts(server, $options[:port])
+    fetch_stats(host, port, data[server])
   end
   data
 end
@@ -153,32 +156,60 @@ def report_by_host(data, queue_name, key)
   by_host.sort.each { |host, v| printf(format, v || "n/a", host) }
 end
 
-def broadcast(command, queue_name, verb)
+def broadcast(command, noun)
   $options[:server_list].each do |server|
-    status "--- #{verb} queue #{queue_name} from #{server}:#{$options[:memcache_port]} ... "
-    with_server(server, $options[:memcache_port]) do |sock|
-      sock.puts("#{command} " + queue_name)
+    (host, port) = get_server_parts(server, $options[:memcache_port])
+    with_server(host, port) do |sock|
+      print_status "--- #{host}:#{port} ... "
+      if(noun)
+        sock.puts("#{command} #{noun}")
+      else
+        sock.puts(command)
+      end
       puts sock.readline.chomp
     end
   end
   puts "Done."
 end
 
-def get_colony_servers
-
-  if ($options[:managed])
-    Net::HTTP.get URI.parse("http://colony.#{$options[:datacenter]}.twitter.com:#{$colony_port}/query?q=(mo%20audubon.role.#{$options[:role]}%20%26%20mo%20audubon.managed.true)")
-  else
-    Net::HTTP.get URI.parse("http://colony.#{$options[:datacenter]}.twitter.com:#{$colony_port}/query?q=mo+audubon.role.#{$options[:role]}")
+def get_server_parts(server, default)
+  server_parts = server.split(":")
+  port = default
+  if server_parts.length > 1
+    port = server_parts[1]
   end
+  return [server_parts[0], port]
+end
+
+def get_colony_servers
+  base_url = "http://colony.#{$options[:datacenter]}.twitter.com:#{$colony_port}"
+  query = ""
+  if ($options[:query])
+    query = $options[:query]
+  elsif ($options[:role])
+    query = "mo audubon.role.#{$options[:role]}"
+  elsif ($options[:group])
+    query = "mo #{$options[:group]}"
+  end
+  if ($options[:managed])
+    query = "#{query} & mo audubon.managed.true"
+  end
+  query = CGI::escape(query)
+  Net::HTTP.get URI.parse("#{base_url}/query?q=(#{query})")
 end
 
 def delete_all(queue_name)
-  broadcast("delete", queue_name, "Deleting")
+  print_status "--- Deleting queue #{queue_name} ... "
+  broadcast("delete", queue_name)
 end
 
 def flush_all(queue_name)
-  broadcast("flush", queue_name, "Flushing")
+  print_status "--- Flushing queue #{queue_name} ... "
+  broadcast("flush", queue_name)
+end
+
+def status_all(status)
+  broadcast("status", status)
 end
 
 def keep_unchanged_data(last, current)
@@ -223,12 +254,13 @@ end
 
 def show_versions
   $options[:server_list].each do |server|
-    verbose "--- Fetching version from #{server}:#{$options[:memcache_port]}"
-    with_server(server, $options[:memcache_port]) do |sock|
+    (host, port) = get_server_parts(server, $options[:memcache_port])
+    verbose "--- Fetching version from #{host}:#{port}"
+    with_server(host, port) do |sock|
       sock.puts("version")
       line = sock.gets.chomp
       line =~ /VERSION (.*)/
-      puts "#{server}: #{$1}"
+      puts "#{host}: #{$1}"
     end
   end
 end
@@ -263,6 +295,12 @@ parser = OptionParser.new do |opts|
   opts.on("-r", "--role=ROLE", "load kestrel server list from colony audubon role (requires colony)") do |role|
     $options[:role] = role
   end
+  opts.on("-g", "--group=GROUP", "load kestrel server list from colony group (requires colony)") do |group|
+    $options[:group] = group
+  end
+  opts.on("-q", "--colony_query=QUERY", "load kestrel server list from colony query (requires colony)") do |query|
+    $options[:query] = query
+  end
   opts.on("-v", "--verbose", "print verbose debugging info as we work") do
     $options[:verbose] = true
   end
@@ -288,10 +326,11 @@ parser = OptionParser.new do |opts|
   opts.separator "    min_age         show minimum age (msec) per queue"
   opts.separator "    max_age         show maximum age (msec) per queue"
   opts.separator ""
-  opts.separator "    delete <name>   remove a queue across the cluster"
-  opts.separator "    flush <name>    drain a queue across the cluster"
-  opts.separator "    stale [rounds]  try to detect stale queues (default: 5 rounds)"
-  opts.separator "    version         report versions of kestrel across the cluster"
+  opts.separator "    status [newstatus]  get or set status of the server"
+  opts.separator "    delete <name>       remove a queue across the cluster"
+  opts.separator "    flush <name>        drain a queue across the cluster"
+  opts.separator "    stale [rounds]      try to detect stale queues (default: 5 rounds)"
+  opts.separator "    version             report versions of kestrel across the cluster"
   opts.separator ""
 end
 
@@ -303,9 +342,16 @@ if ARGV.size < 1
   exit 1
 end
 
-if $options[:role]
-    data = get_colony_servers
-    $options[:server_list] = JSON.parse(data).values.flatten
+if $options[:query]
+  data = get_colony_servers
+  $options[:server_list] = JSON.parse(data).values.flatten
+  abort("managed flag can't be set with colony query flag") if $options[:managed]
+elsif $options[:role]
+  data = get_colony_servers
+  $options[:server_list] = JSON.parse(data).values.flatten
+elsif $options[:group]
+  data = get_colony_servers
+  $options[:server_list] = JSON.parse(data).values.flatten
 elsif $options[:singlehost]
   $options[:server_list] = Array[$options[:singlehost]]
 else
@@ -316,7 +362,7 @@ end
 
 command = ARGV[0].downcase
 
-if (command == "delete" || command == "flush") && !$options[:scriptmode]
+if (command == "delete" || command == "flush" || (command == "status" && ARGV.size == 2)) && !$options[:scriptmode]
   $options[:verbose] = true
 end
 
@@ -369,6 +415,9 @@ elsif command == "flush" && ARGV.size == 2
 elsif command == "stale"
   rounds = ARGV[1] ? ARGV[1].to_i : 5
   find_stale(rounds)
+  exit 0
+elsif command == "status"
+  status_all(ARGV[1])
   exit 0
 end
 

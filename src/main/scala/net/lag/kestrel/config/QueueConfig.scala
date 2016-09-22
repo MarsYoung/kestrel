@@ -19,6 +19,7 @@ package net.lag.kestrel
 package config
 
 import com.twitter.conversions.storage._
+import com.twitter.conversions.time._
 import com.twitter.util.{Duration, StorageUnit}
 
 case class QueueConfig(
@@ -29,20 +30,31 @@ case class QueueConfig(
   defaultJournalSize: StorageUnit,
   maxMemorySize: StorageUnit,
   maxJournalSize: StorageUnit,
+  minJournalCompactDelay: Option[Duration],
   discardOldWhenFull: Boolean,
   keepJournal: Boolean,
   syncJournal: Duration,
   expireToQueue: Option[String],
   maxExpireSweep: Int,
   fanoutOnly: Boolean,
-  maxQueueAge: Option[Duration]
+  maxQueueAge: Option[Duration],
+  enableTrace: Boolean,
+  disableAggressiveRewrites:Boolean,
+  openTransactionTimeout:Option[Duration],
+  whiteListClientIdForDequeue:Option[String] = None,
+  whiteListClientIdForEnqueue:Option[String] = None
 ) {
   override def toString() = {
     ("maxItems=%d maxSize=%s maxItemSize=%s maxAge=%s defaultJournalSize=%s maxMemorySize=%s " +
-     "maxJournalSize=%s discardOldWhenFull=%s keepJournal=%s syncJournal=%s " +
-     "expireToQueue=%s maxExpireSweep=%d fanoutOnly=%s maxQueueAge=%s").format(maxItems, maxSize,
-     maxItemSize, maxAge, defaultJournalSize, maxMemorySize, maxJournalSize, discardOldWhenFull,
-     keepJournal, syncJournal, expireToQueue, maxExpireSweep, fanoutOnly, maxQueueAge)
+     "maxJournalSize=%s minJournalCompactDelay=%s discardOldWhenFull=%s keepJournal=%s " +
+     "syncJournal=%s expireToQueue=%s maxExpireSweep=%d fanoutOnly=%s maxQueueAge=%s " +
+     "enableTrace=%s disableAggressiveRewrites=%s, openTransactionTimeout=%s, " +
+     "whiteListClientIdForDequeue=%s, whiteListClientIdForEnqueue=%s").format(
+      maxItems, maxSize, maxItemSize, maxAge, defaultJournalSize, maxMemorySize,
+      maxJournalSize, minJournalCompactDelay, discardOldWhenFull, keepJournal,
+      syncJournal, expireToQueue, maxExpireSweep, fanoutOnly, maxQueueAge,
+      enableTrace, disableAggressiveRewrites, openTransactionTimeout,
+      whiteListClientIdForDequeue, whiteListClientIdForEnqueue)
   }
 }
 
@@ -104,7 +116,7 @@ class QueueBuilder {
   var maxAge: ConfigValue[Option[Duration]] = Default(None)
 
   /**
-   * If the queue is empty, compact the journal when it reaches this size.
+   * If the queue is empty, truncate the journal when it reaches this size.
    */
   var defaultJournalSize: ConfigValue[StorageUnit] = Default(16.megabytes)
 
@@ -117,10 +129,16 @@ class QueueBuilder {
   var maxMemorySize: ConfigValue[StorageUnit] = Default(128.megabytes)
 
   /**
-   * When the journal gets larger than this, set a checkpoint so that the journal may be compacted
-   * during read-behind (when the queue size in bytes exceeds `maxMemorySize`).
+   * If the queue fits entirely in memory (see maxMemorySize) and the journal files get larger than
+   * this, compact the journal. The journal will not be compacted more than once per
+   * `minJournalCompactDelay`.
    */
   var maxJournalSize: ConfigValue[StorageUnit] = Default(1.gigabyte)
+
+  /**
+   * The minimum amount of time that must pass before consecutive journal compaction operations.
+   */
+  var minJournalCompactDelay: ConfigValue[Option[Duration]] = Default(Some(1.minute))
 
   /**
    * If this is false, when a queue is full, clients attempting to add another item will get an
@@ -141,7 +159,7 @@ class QueueBuilder {
    * To never sync, set it to `Duration.MaxValue`. Syncing the journal will reduce the maximum
    * throughput of the server in exchange for a lower chance of losing data.
    */
-  var syncJournal: ConfigValue[Duration] = Default(Duration.MaxValue)
+  var syncJournal: ConfigValue[Duration] = Default(Duration.Top)
 
   /**
    * Name of a queue to add expired items to. If set, expired items are added to the requested
@@ -167,6 +185,35 @@ class QueueBuilder {
    */
   var maxQueueAge: ConfigValue[Option[Duration]] = Default(None)
 
+  /**
+   * When true, operations on the queue generate trace output. Used to diagnose
+   * client misbehavior/bugs
+   */
+  var enableTrace: ConfigValue[Boolean] = Default(false)
+
+  /**
+   * When true, rewrites are slowed down especially if they don't result in reduction
+   * in the size of the journal
+   */
+  var disableAggressiveRewrites: ConfigValue[Boolean] = Default(false)
+
+  /**
+   * Determines the duration after which an open transaction will be timed out
+   * and aborted - resulting in redelivery of items that were unacknowledged
+   */
+  var openTransactionTimeout: ConfigValue[Option[Duration]] = Default(None)
+
+  /**
+   * Only clientId that is allowed to dequeue items from the specified queue or
+   * fanout
+   */
+  var whiteListClientIdForDequeue: ConfigValue[Option[String]] = Default(None)
+
+  /**
+   * Only clientId that is allowed to enqueue items to the specified queue
+   */
+  var whiteListClientIdForEnqueue: ConfigValue[Option[String]] = Default(None)
+
   def apply(): QueueConfig = apply(None)
 
   def apply(parent: Option[QueueConfig]) = {
@@ -177,12 +224,19 @@ class QueueBuilder {
                 defaultJournalSize.resolve(parent.map { _.defaultJournalSize }),
                 maxMemorySize.resolve(parent.map { _.maxMemorySize }),
                 maxJournalSize.resolve(parent.map { _.maxJournalSize }),
+                minJournalCompactDelay.resolve(parent.map { _.minJournalCompactDelay }),
                 discardOldWhenFull.resolve(parent.map { _.discardOldWhenFull }),
                 keepJournal.resolve(parent.map { _.keepJournal }),
                 syncJournal.resolve(parent.map { _.syncJournal }),
                 expireToQueue.resolve(parent.map { _.expireToQueue }),
                 maxExpireSweep.resolve(parent.map { _.maxExpireSweep }),
                 fanoutOnly.resolve(parent.map { _.fanoutOnly }),
-                maxQueueAge.resolve(parent.map { _.maxQueueAge }))
+                maxQueueAge.resolve(parent.map { _.maxQueueAge }),
+                enableTrace.resolve(parent.map { _.enableTrace }),
+                disableAggressiveRewrites.resolve(parent.map { _.disableAggressiveRewrites}),
+                openTransactionTimeout.resolve(parent.map { _.openTransactionTimeout}),
+                whiteListClientIdForDequeue.resolve(parent.map { _.whiteListClientIdForDequeue}),
+                whiteListClientIdForEnqueue.resolve(parent.map { _.whiteListClientIdForEnqueue})
+                )
   }
 }

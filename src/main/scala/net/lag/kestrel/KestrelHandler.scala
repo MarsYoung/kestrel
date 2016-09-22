@@ -17,8 +17,7 @@
 
 package net.lag.kestrel
 
-import com.twitter.conversions.time._
-import com.twitter.logging.Logger
+import com.twitter.logging.{Level, Logger}
 import com.twitter.ostrich.admin.{BackgroundProcess, ServiceTracker}
 import com.twitter.ostrich.stats.Stats
 import com.twitter.util._
@@ -32,8 +31,16 @@ object TooManyOpenReadsException extends TooManyOpenReadsException
 class ServerStatusNotConfiguredException
 extends Exception("Server status not configured.")
 
-class AvailabilityException(op: String)
-extends Exception("Server not available for operation %s".format(op))
+class AvailabilityException(op: String, serverScope: Boolean)
+extends Exception(op) {
+  def this(op: String) {
+    this("Server not available for operation %s".format(op), true)
+  }
+
+  def this(op: String, queue: String, reason: String)  = {
+    this("The operation %s is disallowed on queue %s. %s".format(op, queue, reason), false)
+  }
+}
 
 trait SimplePendingReads {
   def queues: QueueCollection
@@ -132,30 +139,69 @@ abstract class KestrelHandler(
   protected val log = Logger.get(getClass.getName)
 
   val finished = new AtomicBoolean(false)
-  @volatile var waitingFor: Option[Future[Option[QItem]]] = None
 
-  Kestrel.sessions.incrementAndGet()
+  val waiters: mutable.Set[Future[Option[QItem]]] = mutable.Set()
+
+  val sessionsCount = Kestrel.sessions.incrementAndGet()
+  val (refuseWrites, refuseReads) = Kestrel.checkConnectionLimits(sessionsCount)
   Stats.incr("total_connections")
+
+  if (Kestrel.traceSessions) {
+    log.info("New session %d from %s", sessionId, clientDescription)
+  }
+
+  def sessionDescription(): String = {
+    "Session %d Client %s".format(sessionId, clientDescription)
+  }
 
   // called exactly once by finagle when the session ends.
   def finish() {
-    abortAnyOpenRead()
-    waitingFor.foreach { w =>
-      w.cancel()
-      Stats.incr("cmd_get_timeout_dropped")
+    finished.set(true)
+
+    abortAnyOpenRead(Kestrel.traceSessions)
+    abortWaiters()
+
+    if (Kestrel.traceSessions) {
+      log.info("End of session %d", sessionId)
+    } else {
+      log.debug("End of session %d", sessionId)
     }
-    log.debug("End of session %d", sessionId)
+
     Kestrel.sessions.decrementAndGet()
   }
 
   def flushAllQueues() {
     checkBlockWrites("flushAll", "<all>")
-    queues.queueNames.foreach { qName => queues.flush(qName, Some(clientDescription)) }
+    queues.queueNames.foreach { qName => queues.flush(qName, Some(sessionDescription)) }
   }
 
   protected def countPendingReads(key: String): Int
   protected def addPendingRead(key: String, xid: Int): Option[Long]
   protected def cancelAllPendingReads(): Int
+
+  protected def abortWaiters() {
+    waiters.synchronized {
+      waiters.foreach { w =>
+        w.raise(new FutureCancelledException)
+        Stats.incr("cmd_get_timeout_dropped")
+        Stats.incr("waiters_aborted")
+      }
+      waiters.clear()
+    }
+  }
+
+  protected def addWaiter(w: Future[Option[QItem]]) {
+    waiters.synchronized {
+      waiters += w
+      if (finished.get) abortWaiters()
+    }
+  }
+
+  protected def removeWaiter(w: Future[Option[QItem]]) {
+    waiters.synchronized {
+      waiters -= w
+    }
+  }
 
   // will do a continuous fetch on a queue until time runs out or read buffer is full.
   final def monitorUntil(key: String, timeLimit: Option[Time], maxItems: Int, opening: Boolean)(f: (Option[QItem], Option[Long]) => Unit) {
@@ -175,13 +221,27 @@ abstract class KestrelHandler(
         f(None, None)
       } else {
         Stats.incr("cmd_monitor_get")
-        queues.remove(key, timeLimit, opening, false, Some(clientDescription)).onSuccess {
+        val future = queues.remove(key, timeLimit, opening, false, Some(sessionDescription))
+        addWaiter(future)
+        future.onSuccess {
           case None =>
+            removeWaiter(future)
             f(None, None)
           case x @ Some(item) =>
-            val xidContext = if (opening) addPendingRead(key, item.xid) else None
+            removeWaiter(future)
+            val xidContext = if (opening) {
+              val addedValue = addPendingRead(key, item.xid)
+              if (finished.get()) {
+                Stats.incr("finished_but_add")
+                abortAnyOpenRead(Kestrel.traceSessions)
+                None
+              } else addedValue
+            } else None
             f(x, xidContext)
             monitorLoop(maxItems - 1)
+        } onFailure { case e =>
+          log.error("Failure in monitor-loop while removing item from queue: %s.".format(key))
+          removeWaiter(future)
         }
       }
     }
@@ -194,7 +254,7 @@ abstract class KestrelHandler(
 
     if (opening && countPendingReads(key) >= maxOpenReads) {
       log.warning("Attempt to open too many reads on '%s' (sid %d, %s)", key, sessionId,
-                  clientDescription)
+                  sessionDescription)
       throw TooManyOpenReadsException
     }
 
@@ -205,55 +265,66 @@ abstract class KestrelHandler(
       Stats.incr("cmd_get")
     }
     val startTime = Time.now
-    val future = queues.remove(key, timeout, opening, peeking, Some(clientDescription))
-    waitingFor = Some(future)
+    val future = queues.remove(key, timeout, opening, peeking, Some(sessionDescription))
+    addWaiter(future)
     future.map { itemOption =>
-      waitingFor = None
+      removeWaiter(future)
       itemOption.foreach { item =>
         log.debug("get <- %s", item)
-        if (opening) addPendingRead(key, item.xid)
+        if (opening) {
+          addPendingRead(key, item.xid)
+          if (finished.get()) {
+            Stats.incr("finished_but_add")
+            abortAnyOpenRead(Kestrel.traceSessions)
+          }
+        }
       }
       itemOption
-    }
-    future.onCancellation {
-      // if the connection is closed, pre-emptively return un-acked items.
-      abortAnyOpenRead()
     }
     future
   }
 
-  def abortAnyOpenRead() {
-    Stats.incr("cmd_get_open_dropped", cancelAllPendingReads())
+  def abortAnyOpenRead(trace: Boolean) {
+    val abortedReads = cancelAllPendingReads()
+    Stats.incr("cmd_get_open_dropped", abortedReads)
+    if (trace) {
+      log.info("Aborted %d pending reads", abortedReads)
+    }
   }
 
   def setItem(key: String, flags: Int, expiry: Option[Time], data: Array[Byte]) = {
     checkBlockWrites("setItem", key)
     log.debug("set -> q=%s flags=%d expiry=%s size=%d", key, flags, expiry, data.length)
     Stats.incr("cmd_set")
-    val (rv, nsec) = Duration.inNanoseconds {
-      queues.add(key, data, expiry, Time.now, Some(clientDescription))
-    }
-    Stats.addMetric("set_latency_usec", nsec.inMicroseconds.toInt)
-    Stats.addMetric("q/" + key + "/set_latency_usec", nsec.inMicroseconds.toInt)
+
+    val sw = Stopwatch.start()
+    val rv = queues.add(key, data, expiry, Time.now, Some(sessionDescription))
+
+    // Retrieve a value so that we can add the same value in the global as well as the
+    // queue specific stats
+    val setLatency = sw()
+
+    Stats.addMetric("set_latency_usec", setLatency.inMicroseconds.toInt)
+    Stats.addMetric("q/" + key + "/set_latency_usec", setLatency.inMicroseconds.toInt)
     rv
   }
 
   def flush(key: String) {
     checkBlockWrites("flush", key)
     log.debug("flush -> q=%s", key)
-    queues.flush(key, Some(clientDescription))
+    queues.flush(key, Some(sessionDescription))
   }
 
   def delete(key: String) {
     checkBlockWrites("delete", key)
     log.debug("delete -> q=%s", key)
-    queues.delete(key, Some(clientDescription))
+    queues.delete(key, Some(sessionDescription))
   }
 
   def flushExpired(key: String) = {
     checkBlockWrites("flushExpired", key)
     log.debug("flush_expired -> q=%s", key)
-    queues.flushExpired(key, clientDescription = Some(clientDescription))
+    queues.flushExpired(key, Some(sessionDescription))
   }
 
   private def withServerStatus[T](f: (ServerStatus) => T): T = {
@@ -266,15 +337,15 @@ abstract class KestrelHandler(
   def safeCheckBlockReads: Boolean = serverStatus map { _.blockReads } getOrElse(false)
 
   def checkBlockReads(op: String, key: String) {
-    if (safeCheckBlockReads) {
-      log.debug("Blocking %s on '%s' (sid %d, %s)", op, key, sessionId, clientDescription)
+    if (refuseReads || safeCheckBlockReads) {
+      log.debug("Blocking %s on '%s' (%s)", op, key, sessionDescription)
       throw new AvailabilityException(op)
     }
   }
 
   def checkBlockWrites(op: String, key: String) {
-    if (serverStatus map { _.blockWrites } getOrElse(false)) {
-      log.debug("Blocking %s on '%s' (sid %d, %s)", op, key, sessionId, clientDescription)
+    if (refuseWrites || (serverStatus map { _.blockWrites } getOrElse(false))) {
+      log.debug("Blocking %s on '%s' (%s)", op, key, sessionDescription)
       throw new AvailabilityException(op)
     }
   }
